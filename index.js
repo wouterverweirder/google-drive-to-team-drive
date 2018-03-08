@@ -1,31 +1,44 @@
 //rsync example: rsync -av --exclude='*.gsheet' --exclude="*.gform" --exclude="*.gdoc" --exclude="*.gslides" --exclude="Icon?" 1718_COD/ /Volumes/GoogleDrive/Team\ Drives/Devine/20172018/modules/1718_COD
 
 const path = require(`path`),
+  util = require(`util`),
   fs = require(`fs-extra`),
   inquirer = require(`inquirer`),       // input prompts
   ora = require(`ora`),                 // cli spinner
   progress = require(`cli-progress`),   // progress bar
+  PromiseSemaphore = require(`./lib/PromiseSemaphore.js`),
   {google} = require(`googleapis`),
   {OAuth2Client} = require('google-auth-library');
 
 const argv = require(`yargs`)
-  .command('$0 [inputFolderId] [outputFolderId]')
+  .usage('Usage: $0 <command> [options]')
+  .command('move', 'Move the files to a team drive folder')
+  .command('owner', 'Change ownership (recursive) of a folder')
+  .alias('i', 'inputFolderId')
+  .alias('o', 'outputFolderId')
+  .alias('t', 'outputTeamDriveId')
+  .alias('c', 'newOwnerEmail')
   .describe('inputFolderId', 'The Google Drive id of the folder whose content you want to move')
   .describe('outputFolderId', 'The Google Drive id of the destination folder')
   .describe('outputTeamDriveId', 'The id of the Team Drive of the destination folder')
+  .describe('newOwnerEmail', 'The email address of the new owner')
   .argv;
-
-let {
-  inputFolderId,
-  outputFolderId,
-  outputTeamDriveId
-} = argv;
 
 const SCOPES = [`https://www.googleapis.com/auth/drive`];
 const PROJECT_ROOT = path.resolve(__dirname);
 const TOKEN_DIR = path.resolve(PROJECT_ROOT, `private-keys`)
 const CLIENT_SECRET_PATH = path.resolve(TOKEN_DIR, `client-secret.json`);
 const TOKEN_PATH = path.resolve(TOKEN_DIR, `token.json`);
+
+let {
+  _ :[command=false] = [false],
+  inputFolderId,
+  outputFolderId,
+  outputTeamDriveId,
+  newOwnerEmail
+} = argv;
+
+const validCommands = ['move', 'owner'];
 
 const startTime = Date.now();
 let currentSecond = 0;
@@ -43,73 +56,128 @@ const init = async () => {
     auth: oauth2Client
   });
 
-  const inputQuestions = [];
-  if (!inputFolderId) {
-    inputQuestions.push({
-      type: `input`,
-      name: `inputFolderId`,
-      message: `Enter the Google Drive id of the folder whose content you want to move`,
-      validate: input => input.trim().length > 0
-    });
-  }
-  if (!outputFolderId) {
-    inputQuestions.push({
-      type: `input`,
-      name: `outputFolderId`,
-      message: `Enter the Google Drive id of destination folder`,
-      validate: input => input.trim().length > 0
-    });
-  }
-  if (!outputTeamDriveId) {
-    // list the team drives
-    spinner.start(`Retrieving your team drives`);
-    let teamDrives;
-    try {
-      teamDrives = await driveApiCallAsync(drive.teamdrives.list, {}, async err => {
-        await pause(100);
-        spinner.text = `Retrieving your team drives failed, retrying (${err})`;
-        return true;
-      });
-    } catch (e) {
-      spinner.fail(`${spinner.text} - ${e}`);
-      return;
-    }
-    spinner.succeed(`Retrieving your team drives`);
-    const choices = teamDrives.data.teamDrives.map(teamDrive => {
-      return {
-        name: `${teamDrive.name} (${teamDrive.id})`,
-        value: teamDrive.id
+  // ask for the command if necessary
+  if (!command || !validCommands.includes(command)) {
+    const answers = await inquirer.prompt([
+      {
+        type: `list`,
+        name: `command`,
+        message: `What do you want to do?`,
+        choices: [
+          {
+            name: 'Migrate files to team drive',
+            value: 'move'
+          },
+          {
+            name: 'Change ownership of files and folders',
+            value: 'owner'
+          }
+        ],
+        validate: input => input.trim().length > 0
       }
-    }).concat([{
-      name: `--- none ---`,
-      value: false
-    }]);
-
-    inputQuestions.push({
-      type: `list`,
-      name: `outputTeamDriveId`,
-      message: `Choose the Team Drive of the destination folder`,
-      choices,
-      validate: input => input.trim().length > 0
-    });
+    ]);
+    command = answers.command;
   }
 
-  if (inputQuestions.length > 0) {
-    const answers = await inquirer.prompt(inputQuestions);
-    inputFolderId = inputFolderId || answers.inputFolderId;
-    outputFolderId = outputFolderId || answers.outputFolderId;
-    outputTeamDriveId = outputTeamDriveId || answers.outputTeamDriveId;
+  const inputQuestions = [];
+
+  if (command === `move`) {
+    if (!inputFolderId) {
+      inputQuestions.push({
+        type: `input`,
+        name: `inputFolderId`,
+        message: `Enter the Google Drive id of the folder whose content you want to move`,
+        validate: input => input.trim().length > 0
+      });
+    }
+    if (!outputFolderId) {
+      inputQuestions.push({
+        type: `input`,
+        name: `outputFolderId`,
+        message: `Enter the Google Drive id of destination folder`,
+        validate: input => input.trim().length > 0
+      });
+    }
+    if (!outputTeamDriveId) {
+      // list the team drives
+      spinner.start(`Retrieving your team drives`);
+      let teamDrives;
+      try {
+        teamDrives = await driveApiCallAsync({
+          apiCall: drive.teamdrives.list,
+          retryFn: async err => {
+            await pause(100);
+            spinner.text = `Retrieving your team drives failed, retrying (${err})`;
+            return true;
+          }
+        });
+      } catch (e) {
+        spinner.fail(`${spinner.text} - ${e}`);
+        return;
+      }
+      spinner.succeed(`Retrieving your team drives`);
+      const choices = teamDrives.data.teamDrives.map(teamDrive => {
+        return {
+          name: `${teamDrive.name} (${teamDrive.id})`,
+          value: teamDrive.id
+        }
+      }).concat([{
+        name: `--- none ---`,
+        value: false
+      }]);
+
+      inputQuestions.push({
+        type: `list`,
+        name: `outputTeamDriveId`,
+        message: `Choose the Team Drive of the destination folder`,
+        choices,
+        validate: input => input.trim().length > 0
+      });
+    }
+
+    if (inputQuestions.length > 0) {
+      const answers = await inquirer.prompt(inputQuestions);
+      inputFolderId = inputFolderId || answers.inputFolderId;
+      outputFolderId = outputFolderId || answers.outputFolderId;
+      outputTeamDriveId = outputTeamDriveId || answers.outputTeamDriveId;
+    }
+  } else if (command === `owner`) {
+    if (!inputFolderId) {
+      inputQuestions.push({
+        type: `input`,
+        name: `inputFolderId`,
+        message: `Enter the Google Drive id of the folder you want to change ownership for`,
+        validate: input => input.trim().length > 0
+      });
+    }
+    if (!newOwnerEmail) {
+      inputQuestions.push({
+        type: `input`,
+        name: `newOwnerEmail`,
+        message: `Enter the Email address for the new owner`,
+        validate: input => input.trim().length > 0
+      });
+    }
+    if (inputQuestions.length > 0) {
+      const answers = await inquirer.prompt(inputQuestions);
+      inputFolderId = inputFolderId || answers.inputFolderId;
+      newOwnerEmail = newOwnerEmail || answers.newOwnerEmail;
+    }
   }
 
   // tree folder structure of input folder
   spinner.start(`Checking if input folder exists`);
   let inputTree, outputTree;
   try {
-    const result  = await driveApiCallAsync(drive.files.get, {
-      fileId: inputFolderId,
-      fields: 'id, name'
+    const result  = await driveApiCallAsync({
+      apiCall: drive.files.get,
+      params: {
+        fileId: inputFolderId,
+        fields: 'id, name, permissions'
+      }
     });
     inputTree = result.data;
+    inputTree.owner = getOwnerEmailFromPermissions(inputTree.permissions);
   } catch (e) {
     spinner.fail(`${spinner.text} - ${e}`);
     return;
@@ -117,21 +185,27 @@ const init = async () => {
   spinner.text = `Checking if input folder exists: ${inputTree.name} (${inputTree.id})`;
   spinner.succeed();
 
-  spinner.start(`Checking if output folder exists`);
-  try {
-    const result = await driveApiCallAsync(drive.files.get, {
-      fileId: outputFolderId,
-      fields: 'id, name',
-      supportsTeamDrives: true,
-      outputTeamDriveId
-    });
-    outputTree = result.data;
-  } catch (e) {
-    spinner.fail(`${spinner.text} - ${e}`);
-    return;
+  if (command === `move`) {
+    spinner.start(`Checking if output folder exists`);
+    try {
+      const result = await driveApiCallAsync({
+        apiCall: drive.files.get,
+        params: {
+          fileId: outputFolderId,
+          fields: 'id, name, permissions',
+          supportsTeamDrives: true,
+          outputTeamDriveId
+        }
+      });
+      outputTree = result.data;
+      outputTree.owner = getOwnerEmailFromPermissions(outputTree.permissions);
+    } catch (e) {
+      spinner.fail(`${spinner.text} - ${e}`);
+      return;
+    }
+    spinner.text = `Checking if output folder exists: ${outputTree.name} (${outputTree.id})`;
+    spinner.succeed();
   }
-  spinner.text = `Checking if output folder exists: ${outputTree.name} (${outputTree.id})`;
-  spinner.succeed();
 
   spinner.start(`Retrieving folder structure of the input folder`);
   try {
@@ -147,38 +221,40 @@ const init = async () => {
   spinner.succeed();
   storeSubFoldersIntoLookupObjects(inputTree);
 
-  // ensure we have the same folder structure in the output folder
-  spinner.start(`Retrieving folder structure of the output folder`);
-  try {
-    outputTree.subFolders = await getSubFoldersTree(drive, outputTree.id, {supportsTeamDrives: true, teamDriveId: outputTree.teamDriveId, includeTeamDriveItems: true}, async err => {
-      await pause(100);
-      spinner.text = `Retrieving folder structure of the output folder failed, retrying (${err})`;
-      return true;
-    });
-  } catch (e) {
-    spinner.fail(`${spinner.text} - ${e}`);
-    return;
-  }
-  spinner.succeed();
-  storeSubFoldersIntoLookupObjects(outputTree);
+  if (command === `move`) {
+    // ensure we have the same folder structure in the output folder
+    spinner.start(`Retrieving folder structure of the output folder`);
+    try {
+      outputTree.subFolders = await getSubFoldersTree(drive, outputTree.id, {supportsTeamDrives: true, teamDriveId: outputTree.teamDriveId, includeTeamDriveItems: true}, async err => {
+        await pause(100);
+        spinner.text = `Retrieving folder structure of the output folder failed, retrying (${err})`;
+        return true;
+      });
+    } catch (e) {
+      spinner.fail(`${spinner.text} - ${e}`);
+      return;
+    }
+    spinner.succeed();
+    storeSubFoldersIntoLookupObjects(outputTree);
 
-  // walk through the input tree and create folders with the same name in the output tree
-  spinner.start(`Creating folder structure in output folder`);
-  try {
-    await createSubFoldersIfTheyDontExist(drive, inputTree, outputTree);
-  } catch (e) {
-    spinner.fail(`${spinner.text} - ${e}`);
-    return;
+    // walk through the input tree and create folders with the same name in the output tree
+    spinner.start(`Creating folder structure in output folder`);
+    try {
+      await createSubFoldersIfTheyDontExist(drive, inputTree, outputTree);
+    } catch (e) {
+      spinner.fail(`${spinner.text} - ${e}`);
+      return;
+    }
+    spinner.succeed();
   }
-  spinner.succeed();
 
   // create a dictionary of source folder ids to target folder ids
   const lookupObject = createFlatLookupObject(inputTree, outputTree);
-
   const parentIds = Object.keys(lookupObject);
+
   spinner.start(`Getting file structure`);
   try {
-    filesToMove = await getFilesFromParents(drive, parentIds, async err => {
+    filesToChange = await getFilesFromParents(drive, parentIds, async err => {
       await pause(100);
       spinner.text = `Getting file structure failed, retrying (${err})`;
       return true;
@@ -189,44 +265,151 @@ const init = async () => {
   }
   spinner.succeed();
 
-  const { moveFilesAnswer } = await inquirer.prompt([
-    {
-      type: `confirm`,
-      name: `moveFilesAnswer`,
-      message: `Are you sure you want to move ${filesToMove.length} files?`
+  if (command === `move`) {
+    const { confirmAnswer } = await inquirer.prompt([
+      {
+        type: `confirm`,
+        name: `confirmAnswer`,
+        message: `Are you sure you want to move ${filesToChange.length} files?`
+      }
+    ]);
+
+    if (confirmAnswer) {
+      const promiseSemaphore = new PromiseSemaphore(10);
+      const bar = new progress.Bar({}, progress.Presets.shades_classic);
+      bar.start(filesToChange.length, 0);
+      let numTasksFinished = 0;
+      const failedMoves = [];
+      // move the files to the new folder
+      for(let i = 0; i < filesToChange.length; i++) {
+        const file = filesToChange[i];
+        const removeParents = file.parents;
+        const addParents = file.parents.filter(id => !!lookupObject[id]).map(id => lookupObject[id]);
+
+        promiseSemaphore.add(() => {
+          return driveApiCallAsync({
+            apiCall: drive.files.move,
+            params: {
+              fileId: file.id,
+              addParents,
+              removeParents,
+              supportsTeamDrives: true,
+              teamDriveId: outputTree.teamDriveId,
+              // resource: {
+              //   name: file.name,
+              //   parents: addParents
+              // }
+            },
+            retryFn: async err => {
+              const firstError = getFirstError(err);
+              if (firstError.reason === `fileWriterTeamDriveMoveInDisabled`) {
+                return false;
+              }
+              await pause(100);
+              console.warn(`Move file ${file.name} failed - ${err}`);
+              return true;
+            },
+            failFn: async err => {
+              // store this file in a list of failed files
+              failedMoves.push(file);
+              return Promise.resolve();
+            },
+          }).then(() => {
+            bar.update(++numTasksFinished);
+          });
+        });
+      }
+
+      await promiseSemaphore.start();
+      bar.stop();
+
+      if (failedMoves.length > 0) {
+        console.log(`${failedMoves.length} files could not be moved`);
+        console.log(failedMoves);
+      }
     }
-  ]);
+  } else if (command === `owner`) {
+    const { confirmAnswer } = await inquirer.prompt([
+      {
+        type: `confirm`,
+        name: `confirmAnswer`,
+        message: `Are you sure you want to change ownership of ${filesToChange.length} files?`
+      }
+    ]);
 
-  if (moveFilesAnswer) {
-    const bar = new progress.Bar({}, progress.Presets.shades_classic);
-    bar.start(filesToMove.length, 0);
-    // move the files to the new folder
-    for(let i = 0; i < filesToMove.length; i++) {
-      const file = filesToMove[i];
-      const removeParents = file.parents;
-      const addParents = file.parents.filter(id => !!lookupObject[id]).map(id => lookupObject[id]);
+    if (confirmAnswer) {
+      const permission = {
+        'type': 'user',
+        'role': 'owner',
+        'emailAddress': newOwnerEmail
+      };
 
-      await driveApiCallAsync(drive.files.update, {
-        fileId: file.id,
-        addParents,
-        removeParents,
-        supportsTeamDrives: true,
-        teamDriveId: outputTree.teamDriveId
-      }, async err => {
-        await pause(100);
-        console.warn(`Move file ${file.name} failed - retrying - ${err}`);
-        return true;
-      });
-      bar.update(i + 1);
+      const promiseSemaphore = new PromiseSemaphore(10);
+      const bar = new progress.Bar({}, progress.Presets.shades_classic);
+      bar.start(filesToChange.length, 0);
+      let numTasksFinished = 0;
+      const failedChanges = [];
+      // change the ownership of the files
+      for(let i = 0; i < filesToChange.length; i++) {
+        const file = filesToChange[i];
+
+        promiseSemaphore.add(() => {
+          return driveApiCallAsync({
+            apiCall: drive.permissions.create,
+            params: {
+              fileId: file.id,
+              resource: permission,
+              transferOwnership: true,
+              sendNotificationEmails: false
+            },
+            retryFn: async err => {
+              const firstError = getFirstError(err);
+              if (firstError.reason === `invalidSharingRequest`) {
+                return false;
+              }
+              await pause(100);
+              console.warn(`Change ownership of ${file.name} failed - ${firstError.reason}`);
+              return true;
+            },
+            failFn: async err => {
+              // store this file in a list of failed files
+              failedChanges.push(file);
+              return Promise.resolve();
+            },
+          }).then(() => {
+            bar.update(++numTasksFinished);
+          });
+        });
+      }
+
+      await promiseSemaphore.start();
+      bar.stop();
+
+      if (failedChanges.length > 0) {
+        console.log(`${failedChanges.length} files could be changed`);
+        console.log(failedChanges);
+      }
     }
-    bar.stop();
-
-    console.log(`All Done!`);
   }
+
+  console.log(`Done`);
 };
 
 const getNumSecondsRunning = () => {
   return Math.floor((Date.now() - startTime) / 1000);
+};
+
+const getOwnerPermissionFromPermissions = (permissions = []) => {
+  if (!Array.isArray(permissions)) {
+    return false;
+  }
+  const [permission = false] = permissions.filter(permission => permission.role === 'owner');
+  return permission;
+};
+
+const getOwnerEmailFromPermissions = (permissions = []) => {
+  const { emailAddress = false } = getOwnerPermissionFromPermissions(permissions);
+  return emailAddress;
 };
 
 const storeSubFoldersIntoLookupObjects = folder => {
@@ -255,19 +438,39 @@ const getSimpleTreeObject = treeObject => {
 };
 
 const getSubFoldersTree = async (drive, parentFolderId, extraArgs = {}, retryFn = async (err) => Promise.resolve().then(() => false)) => {
-  const subFolders = await listFilesNotPaged(drive, {
-    spaces: `drive`,
-    fields: 'nextPageToken, files(id, name)',
-    q: `'${parentFolderId}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
-    ... extraArgs
-  }, retryFn);
-  for (let i = 0; i < subFolders.length; i++) {
-    const subFolder = subFolders[i];
-    subFolder.subFolders = await getSubFoldersTree(drive, subFolder.id, extraArgs, retryFn);
-    // create extra lookup objects
-    storeSubFoldersIntoLookupObjects(subFolder);
-  }
-  return subFolders;
+
+  const promiseSemaphore = new PromiseSemaphore(10);
+
+  const getSubFolders = (parentFolderId) => {
+    return Promise.resolve()
+      .then(() => {
+        return listFilesNotPaged(drive, {
+          spaces: `drive`,
+          fields: 'nextPageToken, files(id, name, permissions)',
+          q: `'${parentFolderId}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
+          ... extraArgs
+        }, retryFn);
+      }).then(subFolders => {
+        // add getSubFolders tasks to the queue
+        subFolders.forEach(subFolder => {
+          promiseSemaphore.add(() => {
+            return getSubFolders(subFolder.id)
+              .then(subSubFolders => subFolder.subFolders = subSubFolders)
+              .then(() => storeSubFoldersIntoLookupObjects(subFolder));
+          });
+        });
+        return subFolders;
+      });
+  };
+
+  promiseSemaphore.add(() => {
+    return getSubFolders(parentFolderId)
+      .then(result => rootSubFolders = result);
+  });
+
+  await promiseSemaphore.start();
+
+  return rootSubFolders;
 };
 
 /**
@@ -275,16 +478,28 @@ const getSubFoldersTree = async (drive, parentFolderId, extraArgs = {}, retryFn 
  */
 const getFilesFromParents = async (drive, parentIds, retryFn = async (err) => Promise.resolve().then(() => false)) => {
   const allFiles = [];
+
+  const promiseSemaphore = new PromiseSemaphore(10);
+
   for (let i = 0; i < parentIds.length; i++) {
-    const files = await listFilesNotPaged(drive, {
-      spaces: `drive`,
-      fields: 'nextPageToken, files(id, name, parents)',
-      q: `('${parentIds[i]}' in parents) and
-      trashed = false and
-      (mimeType != 'application/vnd.google-apps.folder')`
-    }, retryFn);
-    files.forEach(file => allFiles.push(file));
+    promiseSemaphore.add(() => {
+      return listFilesNotPaged(drive, {
+        spaces: `drive`,
+        fields: 'nextPageToken, files(id, name, parents, permissions)',
+        q: `('${parentIds[i]}' in parents) and
+        trashed = false and
+        (mimeType != 'application/vnd.google-apps.folder')`
+      }, retryFn).then(files => {
+        files.forEach(file => {
+          file.owner = getOwnerEmailFromPermissions(file.permissions);
+          allFiles.push(file)
+        });
+      });
+    });
   }
+
+  await promiseSemaphore.start();
+
   return allFiles;
 };
 
@@ -294,37 +509,65 @@ const getFilesFromParents = async (drive, parentIds, retryFn = async (err) => Pr
  * create a subFolder with that name if it doesn't exist in the target folder
  */
 const createSubFoldersIfTheyDontExist = async (drive, sourceFolder, targetFolder) => {
-  for (let i = 0; i < sourceFolder.subFolders.length; i++) {
-    const subFolder = sourceFolder.subFolders[i];
-    if (!targetFolder.subFoldersByName[subFolder.name]) {
-      // create the subfolder in the targetFolder
-      const {data: createdSubFolder} = await driveApiCallAsync(drive.files.create, {
-        resource: {
-          name: subFolder.name,
-          mimeType: `application/vnd.google-apps.folder`,
-          parents: [targetFolder.id]
-        },
-        fields: `id`,
-        supportsTeamDrives: true,
-        outputTeamDriveId
-      }, async err => {
-        await pause(100);
-        console.warn(`Create folder "${subFolder.name}" failed - retrying - ${err}`);
-        return true;
+
+  const promiseSemaphore = new PromiseSemaphore(10);
+
+  const createSubFolderIfItDoesntExist = (sourceSubFolder, targetFolder) => {
+    let seq = Promise.resolve();
+    if (!targetFolder.subFoldersByName[sourceSubFolder.name]) {
+      seq = seq.then(() => {
+        return driveApiCallAsync({
+          apiCall: drive.files.create,
+          params: {
+            resource: {
+              name: sourceSubFolder.name,
+              mimeType: `application/vnd.google-apps.folder`,
+              parents: [targetFolder.id]
+            },
+            fields: `id`,
+            supportsTeamDrives: true,
+            outputTeamDriveId
+          },
+          retryFn: async err => {
+            await pause(100);
+            console.warn(`Create folder "${sourceSubFolder.name}" failed - retrying - ${err}`);
+            return true;
+          }
+        });
+      }).then(({ data: createdSubFolder }) => {
+        // add it to the tree object
+        createdSubFolder.name = sourceSubFolder.name;
+        storeSubFoldersIntoLookupObjects(createdSubFolder);
+        targetFolder.subFolders.push(createdSubFolder);
+        targetFolder.subFoldersById[createdSubFolder.id] = createdSubFolder;
+        targetFolder.subFoldersByName[createdSubFolder.name] = createdSubFolder;
       });
-      // add it to the tree object
-      createdSubFolder.name = subFolder.name;
-      storeSubFoldersIntoLookupObjects(createdSubFolder);
-      targetFolder.subFolders.push(createdSubFolder);
-      targetFolder.subFoldersById[createdSubFolder.id] = createdSubFolder;
-      targetFolder.subFoldersByName[createdSubFolder.name] = createdSubFolder;
     }
-    // process the subfolders of the subFolder
-    await createSubFoldersIfTheyDontExist(drive, subFolder, targetFolder.subFoldersByName[subFolder.name]);
+    seq = seq.then(() => {
+      const targetSubFolder = targetFolder.subFoldersByName[sourceSubFolder.name];
+      sourceSubFolder.subFolders.forEach(sourceSubSubFolder => {
+        // add createSubFolderIfItDoesntExist tasks to the queue
+        promiseSemaphore.add(() => {
+          return createSubFolderIfItDoesntExist(sourceSubSubFolder, targetSubFolder);
+        });
+      });
+    });
+    return seq;
   };
+
+  sourceFolder.subFolders.forEach(sourceSubFolder => {
+    promiseSemaphore.add(() => {
+      return createSubFolderIfItDoesntExist(sourceSubFolder, targetFolder);
+    });
+  });
+
+  await promiseSemaphore.start();
 };
 
 const createFlatLookupObject = (sourceFolder, targetFolder, lookupObject = {}) => {
+  if (!targetFolder) { // in move command we dont have target folder
+    targetFolder = sourceFolder;
+  }
   lookupObject[sourceFolder.id] = targetFolder.id;
   sourceFolder.subFolders.forEach(sourceSubFolder => {
     const targetSubFolder = targetFolder.subFoldersByName[sourceSubFolder.name];
@@ -349,8 +592,15 @@ const listFilesNotPaged = async (drive, params, retryFn = async (err) => Promise
   const allFiles = [];
   do {
     const newParams = {... params, pageToken: nextPageToken};
-    const response = await driveApiCallAsync(drive.files.list, newParams, retryFn);
-    response.data.files.forEach(file => allFiles.push(file));
+    const response = await driveApiCallAsync({
+      apiCall: drive.files.list,
+      params: newParams,
+      retryFn
+    });
+    response.data.files.forEach(file => {
+      file.owner = getOwnerEmailFromPermissions(file.permissions);
+      allFiles.push(file)
+    });
     nextPageToken = response.data.nextPageToken;
   } while (nextPageToken);
   return allFiles;
@@ -360,7 +610,13 @@ const listFilesNotPaged = async (drive, params, retryFn = async (err) => Promise
  * Execute a call to the drive api
  * Will wait if we might run into api limits
  */
-const driveApiCallAsync = async (apiCall, params, retryFn = async (err) => Promise.resolve().then(() => false)) => {
+const driveApiCallAsync = async ( options ) => {
+  const {
+    apiCall,
+    params = {},
+    retryFn = async (err) => Promise.resolve().then(() => false),
+    failFn = async (err) => Promise.reject(err)
+  } = options;
 
   const fn = async (apiCall, params, retryFn) => {
     // check the number of requests don the last second (limit to 10)
@@ -380,10 +636,12 @@ const driveApiCallAsync = async (apiCall, params, retryFn = async (err) => Promi
             .then(() => retryFn(err))
             .then(retryResult => {
               if (retryResult) {
-                return fn(apiCall, params, retryFn).then(o => resolve(o));
+                return fn(apiCall, params, retryFn);
               }
-              return reject(err);
-            });
+              return failFn(err);
+            })
+            .then(o => resolve(o))
+            .catch(err => reject(err));
         }
         return resolve(result);
       });
@@ -391,6 +649,11 @@ const driveApiCallAsync = async (apiCall, params, retryFn = async (err) => Promi
   }
 
   return await fn(apiCall, params, retryFn);
+};
+
+const getFirstError = (error) => {
+  const { errors:[first=false] = [false] } = error;
+  return first;
 };
 
 const authorize = async (credentials) => {
@@ -422,11 +685,11 @@ const getNewToken = async (oauth2Client) => {
     inquirer.prompt([
       {
         type: `input`,
-        name: `token`,
+        name: `code`,
         message: `Enter the code from that page here`,
         validate: input => input.trim().length > 0
       }
-    ]).then(({ token }) => {
+    ]).then(({ code }) => {
       oauth2Client.getToken(code, function(err, token) {
         if (err) {
           return reject(err)
