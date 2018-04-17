@@ -12,3 +12,9 @@ This project was created because migrating content through the web interface or 
 - Download the client secret you just created, and place it in a folder called "private-keys" in the root of this project. Rename the file to "client-secret.json"
 
 ## Usage
+
+Run node index.js to go through an interactive shell wizard.
+
+```
+$ node index.js
+```
